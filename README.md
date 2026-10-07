@@ -54,4 +54,10 @@ overlay yoksa `base` seçeneği listelenir. `change` seçimi şu etiketi üretir
 sot/<policy>=change-<isim>
 ```
 
+`change` dizininin alt dizini yoksa (örneğin yalnızca `kustomization.yaml`
+içeriyorsa) seçenek `change` olur ve `sot/<policy>=change` etiketi üretilir.
+Policy'nin overlay'i de yoksa kullanıcıya hiçbir şey sorulmadan bu etiket
+doğrudan üretilir; overlay'i varsa menüde `change` ve `overlays-<overlay>`
+seçenekleri gösterilir.
+
 `change` dizini olmayan policy'ler önceki gibi overlay/base mantığıyla çalışır.

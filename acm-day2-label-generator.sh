@@ -43,11 +43,14 @@ MOCK_CHANGES=(
   "logging6|test"
   "logging6|prod-ocpadmins"
 )
+# Alt dizini olmayan (yalnızca kustomization.yaml içeren) change dizinine sahip policy'ler.
+MOCK_FLAT_CHANGE_POLICIES=("monitoring")
 
 POLICIES=()
 POLICY_COUNT=0
 OVERLAY_POLICIES=()
 OVERLAYS=()
+CHANGE_DIR_POLICIES=()
 CHANGE_POLICIES=()
 CHANGES=()
 BASE_POLICIES=()
@@ -214,8 +217,16 @@ load_mock_inventory() {
   done
   for entry in "${MOCK_CHANGES[@]}"; do
     policy="${entry%%|*}"
+    CHANGE_DIR_POLICIES+=("$policy")
     CHANGE_POLICIES+=("$policy")
     CHANGES+=("${entry#*|}")
+    if ! policy_exists "$policy"; then
+      POLICIES+=("$policy")
+      POLICY_COUNT=$((POLICY_COUNT + 1))
+    fi
+  done
+  for policy in "${MOCK_FLAT_CHANGE_POLICIES[@]}"; do
+    CHANGE_DIR_POLICIES+=("$policy")
     if ! policy_exists "$policy"; then
       POLICIES+=("$policy")
       POLICY_COUNT=$((POLICY_COUNT + 1))
@@ -253,13 +264,15 @@ load_repo_inventory() {
         relative_dir="${resource_dir#"$RESOURCES_PATH"/}"
         [[ "$relative_dir" == */*/* ]] && continue
         policy="${relative_dir%/change}"
+        # change dizini alt dizin içermese de (yalnızca kustomization.yaml) kaydedilir.
+        CHANGE_DIR_POLICIES+=("$policy")
+        if ! policy_exists "$policy"; then
+          POLICIES+=("$policy")
+          POLICY_COUNT=$((POLICY_COUNT + 1))
+        fi
         while IFS= read -r -d '' change_dir; do
           CHANGE_POLICIES+=("$policy")
           CHANGES+=("${change_dir##*/}")
-          if ! policy_exists "$policy"; then
-            POLICIES+=("$policy")
-            POLICY_COUNT=$((POLICY_COUNT + 1))
-          fi
         done < <(find "$resource_dir" -mindepth 1 -maxdepth 1 -type d -print0)
         ;;
       */resources/*/base)
@@ -338,11 +351,11 @@ policy_changes() {
   done | sort -u
 }
 
-# Policy'nin change/ altında en az bir dizini olup olmadığını kontrol eder.
+# Policy'nin change/ dizini olup olmadığını kontrol eder (alt dizin şart değil).
 policy_has_change() {
   local policy="$1" i
-  for ((i = 0; i < ${#CHANGE_POLICIES[@]}; i++)); do
-    [[ "${CHANGE_POLICIES[$i]}" == "$policy" ]] && return 0
+  for ((i = 0; i < ${#CHANGE_DIR_POLICIES[@]}; i++)); do
+    [[ "${CHANGE_DIR_POLICIES[$i]}" == "$policy" ]] && return 0
   done
   return 1
 }
@@ -453,19 +466,32 @@ choose_overlay() {
 
 # change/ dizini olan policy için change-<dizin> seçeneklerini, varsa
 # overlays-<overlay> seçeneklerini, overlay yoksa base seçeneğini listeler.
+# change/ alt dizin içermiyorsa seçenek "change" olur; overlay da yoksa
+# kullanıcıya sorulmadan doğrudan sot/<policy>=change üretilir.
 choose_change() {
   local policy="$1"
   local menu_options=()
   local item selected_index
+  local change_count=0
   while IFS= read -r item; do
-    [[ -n "$item" ]] && menu_options+=("change-$item")
+    [[ -n "$item" ]] || continue
+    menu_options+=("change-$item")
+    change_count=$((change_count + 1))
   done < <(policy_changes "$policy")
+  [[ $change_count -gt 0 ]] || menu_options+=("change")
   local overlay_count=0
   while IFS= read -r item; do
     [[ -n "$item" ]] || continue
     menu_options+=("overlays-$item")
     overlay_count=$((overlay_count + 1))
   done < <(policy_overlays "$policy" | sort -u)
+
+  if [[ $change_count -eq 0 && $overlay_count -eq 0 ]]; then
+    SELECTED_POLICIES+=("$policy")
+    SELECTED_VALUES+=("change")
+    return 0
+  fi
+
   if [[ $overlay_count -eq 0 ]] && contains "$policy" "${BASE_POLICIES[@]+"${BASE_POLICIES[@]}"}"; then
     menu_options+=("base")
   fi
