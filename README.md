@@ -1,13 +1,30 @@
 # ACM Day-2 Label Generator
 
 `acm-day2-label-generator.sh`, `policy-repo` içindeki policy overlay, change ve
-base dizinlerini analiz eder ve Hub cluster üzerinde kullanılacak iki çıktı
+base dizinlerini analiz eder ve Hub cluster üzerinde kullanılacak şu çıktıları
 üretir:
 
 | Çıktı | İçerik |
 |---|---|
 | `apply-labels-<cluster>.sh` | `oc label managedcluster` komutları (çalıştırılabilir script) |
-| `manifestwork-<cluster>-<policy>-<secim>.yaml` | Seçilen her overlay/change dizininin `kubectl kustomize` çıktısını içeren, `propagationPolicy: Orphan` ve `updateStrategy: CreateOnly` ayarlı OCM ManifestWork |
+| `apply-manifestworks-<cluster>.sh` | `manifestwork/` altındaki ManifestWork'leri tek seferlik uygulayan script: oluştur → `Applied` bekle → sil |
+| `manifestwork/manifestwork-<cluster>-<policy>-<secim>.yaml` | Seçilen her overlay/change dizininin `kubectl kustomize` çıktısını içeren, `propagationPolicy: Orphan` ve `updateStrategy: ServerSideApply` (`force`) ayarlı OCM ManifestWork |
+
+Örnek çıktı dizini (`--output-dir out/`):
+
+```
+out/
+├── apply-labels-ocp-prod-01.sh
+├── apply-manifestworks-ocp-prod-01.sh
+└── manifestwork/
+    ├── manifestwork-ocp-prod-01-kubeletconfig-overlays-prod.yaml
+    └── manifestwork-ocp-prod-01-logging6-change-prod.yaml
+```
+
+`manifestwork/` dizini birden fazla çalıştırmanın dosyalarını biriktirebilir.
+Script eski dosyaları silmez. Aynı cluster için önceki bir çalıştırmadan kalan
+ve bu çalıştırmada üretilmeyen dosyalar için uyarı verir. Uygulama scripti
+yalnızca o çalıştırmada üretilen ManifestWork'leri uygular.
 
 ## Gereksinimler
 
@@ -32,7 +49,7 @@ chmod +x acm-day2-label-generator.sh
 |---|---|---|
 | `--repo VALUE` | `POLICY_REPO` | Yerel policy-repo yolu veya Git remote URL'si |
 | `--cluster NAME` | `CLUSTER_NAME` | Managed cluster adı; verilmezse sorulur |
-| `--output-dir DIR` | | Çıktı dizini (varsayılan: `.`); yoksa oluşturulur |
+| `--output-dir DIR` | | Çıktı dizini (varsayılan: `.`); yoksa oluşturulur. ManifestWork YAML'ları `DIR/manifestwork/` altına yazılır |
 | `--output PATH` | | Label scriptinin yolu (varsayılan: `DIR/apply-labels-<cluster>.sh`) |
 | `--no-manifestwork` | | ManifestWork üretmez, yalnızca label scripti üretir |
 
@@ -112,10 +129,11 @@ metadata:
   namespace: <cluster>          # hub'daki managed cluster namespace'i
   labels:
     app.kubernetes.io/managed-by: acm-day2-label-generator
-    sot/policy: <policy>
-    sot/selection: <secim>
+    acm-sot/policy: <policy>
+    acm-sot/selection: <secim>
   annotations:
-    sot/source-path: <policy>/<overlays|change>/<x>
+    acm-sot/source-path: <policy>/<overlays|change>/<x>
+    acm-sot/lifecycle: apply-once
 spec:
   deleteOption:
     propagationPolicy: Orphan   # ManifestWork silinse de objeler cluster'da kalır
@@ -126,44 +144,74 @@ spec:
         name: set-max-pods
         # namespace: yalnızca namespaced objelerde
       updateStrategy:
-        type: CreateOnly        # yalnızca yoksa oluştur, asla güncelleme
+        type: ServerSideApply   # yoksa oluştur, varsa güncelle
+        serverSideApply:
+          force: true           # başka field manager'lara ait alanları devral
   workload:
     manifests:
       - <kubectl kustomize çıktısındaki her obje>
 ```
 
-### `Orphan` + `CreateOnly` birlikte
+### Tek seferlik uygulama: uygula → bekle → sil
 
-| Ayar | Etkisi |
+OCM'de "bir kez uygula, sonra bırak" diye bir `updateStrategy` yoktur.
+`ServerSideApply`, ManifestWork hub'da durduğu sürece objeyi yönetmeye ve
+drift'i geri almaya devam eder. Bu yüzden tek seferlik davranış, ManifestWork
+uygulandıktan sonra silinerek elde edilir:
+
+| Ayar / adım | Etkisi |
 |---|---|
+| `updateStrategy: ServerSideApply` + `force: true` | Obje yoksa oluşturulur; varsa yalnızca manifestteki alanlar güncellenir. Installer veya operator'ün sahiplendiği alanlar da devralınır. |
 | `deleteOption.propagationPolicy: Orphan` | ManifestWork silindiğinde objeler cluster'dan silinmez. |
-| `updateStrategy: CreateOnly` | Work agent objeyi yalnızca cluster'da yoksa oluşturur. Var olan objeyi hiçbir zaman güncellemez; sonradan cluster'da yapılan değişiklikler geri alınmaz. |
-
-Bu iki ayar birlikte enjeksiyonu gerçekten tek seferlik yapar.
-
-Dikkat edilmesi gerekenler:
-
-- `CreateOnly`, cluster'da **zaten var olan** objeleri değiştirmez. OpenShift'in
-  `config.openshift.io` / `operator.openshift.io` singleton'ları (`Proxy/cluster`,
-  `APIServer/cluster`, `Scheduler/cluster` vb.) her zaman var olduğu için bunlara
-  yapılan değişiklikler uygulanmaz; script bu durumda uyarı verir.
-- `resourceIdentifier.resource`, Kind'ın çoğul resource adıdır ve standart çoğul
-  kuralıyla türetilir (`KubeletConfig` → `kubeletconfigs`, `Proxy` → `proxies`).
-  Kurala uymayan bir Kind için yanlış ad üretilirse o objede `CreateOnly`
-  sessizce uygulanmaz. Böyle Kind'ları scriptteki `KIND_RESOURCE_OVERRIDES`
-  dizisine `Kind=resource` olarak ekleyin. Doğru adı
-  `oc api-resources | grep -i <kind>` ile kontrol edebilirsiniz. Script her
-  ManifestWork için kullanılan `resource/name` listesini ekrana basar.
-- `updateStrategy` alanı eski ACM/OCM sürümlerinde bulunmaz. Hub'ınızda
-  desteklendiğini şu komutla doğrulayın:
-  `oc explain manifestwork.spec.manifestConfigs.updateStrategy`
+| `apply-manifestworks-<cluster>.sh` | Her ManifestWork'ü oluşturur, `Applied` koşulunu bekler ve siler. Silme sonrası objeler cluster'da kalır ve artık hiçbir şey tarafından yönetilmez. |
 
 Hub üzerinde uygulamak için:
 
 ```bash
 bash apply-labels-ocp-prod-01.sh
-oc apply -f manifestwork-ocp-prod-01-kubeletconfig-overlays-prod.yaml
+bash apply-manifestworks-ocp-prod-01.sh
 ```
+
+`apply-manifestworks-<cluster>.sh`, ManifestWork dosyalarını kendi bulunduğu
+dizindeki `manifestwork/` alt dizininden okur; bu yüzden hangi dizinden
+çalıştırıldığı fark etmez. Her ManifestWork için sırasıyla şunları yapar:
+
+1. Önceki bir çalıştırmadan kalan aynı adlı ManifestWork'ü siler. Bunun nedeni,
+   eski `Applied` durumunun yanlış pozitif vermesini önlemek. `Orphan` olduğu
+   için objeler etkilenmez.
+2. ManifestWork'ü `oc create` ile oluşturur.
+3. `oc wait --for=condition=Applied` ile uygulanmasını bekler.
+4. ManifestWork'ü siler.
+
+Bekleme zaman aşımına uğrarsa script hata koduyla durur. Bu durumda
+ManifestWork'ün koşullarını ekrana basar, sonraki ManifestWork'lere geçmez ve
+hatalı ManifestWork'ü incelenmek üzere hub'da bırakır.
+
+| Ortam değişkeni | Varsayılan | Açıklama |
+|---|---|---|
+| `OC` | `oc` | Kullanılacak CLI (`kubectl` de olabilir) |
+| `MANIFESTWORK_TIMEOUT` | `10m` | Silme ve `Applied` bekleme adımlarının her biri için zaman aşımı |
+
+Dikkat edilmesi gerekenler:
+
+- ManifestWork dosyalarını doğrudan `oc apply` ile uygulamayın. Bu durumda
+  silinene kadar objeleri `ServerSideApply` ile yönetmeye ve drift'i geri almaya
+  devam ederler.
+- Var olan bir `KubeletConfig`, `MachineConfig` veya `ContainerRuntimeConfig`
+  güncellenirse MCO ilgili pool'daki node'ları sırayla yeniden başlatır. Script
+  `machineconfiguration.openshift.io` objeleri için uyarı verir. Bu tür
+  değişiklikleri bakım penceresinde uygulayın.
+- `resourceIdentifier.resource`, Kind'ın çoğul resource adıdır ve standart çoğul
+  kuralıyla türetilir (`KubeletConfig` → `kubeletconfigs`, `Proxy` → `proxies`).
+  Kurala uymayan bir Kind için yanlış ad üretilirse `ServerSideApply` o objeye
+  uygulanmaz. Obje yine uygulanır, ama varsayılan `Update` stratejisiyle (tüm
+  objeyi yazarak) ve sessizce. Böyle Kind'ları scriptteki
+  `KIND_RESOURCE_OVERRIDES` dizisine `Kind=resource` olarak ekleyin. Doğru adı
+  `oc api-resources | grep -i <kind>` ile kontrol edebilirsiniz. Script her
+  ManifestWork için kullanılan `resource/name` listesini ekrana basar.
+- `updateStrategy` alanı eski ACM/OCM sürümlerinde bulunmaz. Hub'ınızda
+  desteklendiğini şu komutla doğrulayın:
+  `oc explain manifestwork.spec.manifestConfigs.updateStrategy.serverSideApply`
 
 ### Doğrulamalar ve hata yönetimi
 
@@ -174,8 +222,9 @@ oc apply -f manifestwork-ocp-prod-01-kubeletconfig-overlays-prod.yaml
   script sonlanır.
 - Derleme boş çıkarsa veya `apiVersion`/`kind` içermeyen bir doküman varsa
   script sonlanır.
-- Üretilen dosyadaki `propagationPolicy: Orphan` değeri, manifest sayısı ve her
-  manifest için bir `CreateOnly` girdisi olduğu tekrar okunarak doğrulanır.
+- Üretilen dosya tekrar okunarak şunlar doğrulanır: `propagationPolicy: Orphan`
+  değeri, manifest sayısı ve her manifest için bir `ServerSideApply` (`force`)
+  girdisi olduğu.
 - Tüm çıktılar önce geçici bir dizinde hazırlanır ve yalnızca tüm adımlar
   başarılıysa çıktı dizinine taşınır. Hata durumunda yarım çıktı kalmaz.
 - Uyarılar:
@@ -183,4 +232,5 @@ oc apply -f manifestwork-ocp-prod-01-kubeletconfig-overlays-prod.yaml
   - Managed cluster'a gönderilecek ACM hub objeleri (`Policy`,
     `PlacementBinding` vb.) için.
   - OCM'in 500 KiB manifest sınırını aşan dosyalar için.
-  - `CreateOnly` nedeniyle güncellenmeyecek OpenShift singleton objeleri için.
+  - Güncellendiğinde node yeniden başlatmasına yol açabilecek
+    `machineconfiguration.openshift.io` objeleri için.

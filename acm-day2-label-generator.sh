@@ -11,12 +11,16 @@
 # Çıktılar (varsayılan olarak --output-dir, yani bulunulan dizin altına):
 #   apply-labels-<cluster>.sh
 #       Hub üzerinde çalıştırılacak "oc label managedcluster" komutları.
-#   manifestwork-<cluster>-<policy>-<secim>.yaml
+#   manifestwork/manifestwork-<cluster>-<policy>-<secim>.yaml
 #       Seçilen her overlay/change dizini için "kubectl kustomize" ile derlenen
-#       objeleri içeren ManifestWork. spec.deleteOption.propagationPolicy=Orphan
-#       olduğu için ManifestWork silinse bile objeler hedef cluster'da kalır.
-#       Her obje için updateStrategy=CreateOnly tanımlandığından objeler yalnızca
-#       yoksa oluşturulur; sonradan cluster'da yapılan değişiklikler ezilmez.
+#       objeleri içeren ManifestWork. Her obje için updateStrategy=ServerSideApply
+#       (force) tanımlıdır: obje yoksa oluşturulur, varsa güncellenir.
+#       spec.deleteOption.propagationPolicy=Orphan olduğu için ManifestWork
+#       silinse bile objeler hedef cluster'da kalır.
+#   apply-manifestworks-<cluster>.sh
+#       manifestwork/ alt dizinindeki ManifestWork'leri tek seferlik uygular:
+#       oluştur -> Applied koşulunu bekle -> sil. Silme sonrası objeler
+#       cluster'da kalır ve artık ManifestWork tarafından yönetilmez.
 #
 # Script, whiptail veya dialog varsa menülü bir arayüz kullanır. İkisi de
 # yoksa aynı akış standart read komutları ile devam eder.
@@ -40,11 +44,14 @@ KUSTOMIZE_CMD=()
 # 500 KiB ile sınırlar; bu değeri aşan dosyalar için uyarı verilir.
 MANIFESTWORK_SIZE_LIMIT=$((500 * 1024))
 MANIFESTWORK_MANAGED_BY="acm-day2-label-generator"
+# ManifestWork YAML'larının yazıldığı, --output-dir altındaki alt dizin.
+MANIFESTWORK_SUBDIR="manifestwork"
 
 # manifestConfigs.resourceIdentifier.resource alanı Kind'ın çoğul resource adını
 # ister. Adlar kind_to_resource içinde standart İngilizce çoğul kuralıyla
 # türetilir; kurala uymayan Kind'lar buraya "Kind=resource" olarak eklenmelidir.
-# Yanlış bir resource adı CreateOnly ayarının sessizce uygulanmamasına yol açar.
+# Yanlış bir resource adında ServerSideApply ayarı o objeye uygulanmaz ve obje
+# sessizce varsayılan Update stratejisiyle (tüm objeyi yazarak) uygulanır.
 KIND_RESOURCE_OVERRIDES=(
   "Endpoints=endpoints"
   "SecurityContextConstraints=securitycontextconstraints"
@@ -111,7 +118,8 @@ Kullanım: $SCRIPT_NAME [--repo PATH_OR_GIT_URL] [--cluster NAME] [--output-dir 
 Seçenekler:
   --repo VALUE        Yerel policy-repo yolu veya Git repo URL'si (varsayılan: POLICY_REPO)
   --cluster NAME      Managed cluster adı (varsayılan: CLUSTER_NAME, verilmezse sorulur)
-  --output-dir DIR    Üretilen dosyaların yazılacağı dizin (varsayılan: .)
+  --output-dir DIR    Üretilen dosyaların yazılacağı dizin (varsayılan: .);
+                      ManifestWork YAML'ları DIR/$MANIFESTWORK_SUBDIR/ altına yazılır
   --output PATH       Label scriptinin yolu (varsayılan: DIR/apply-labels-<cluster>.sh)
   --no-manifestwork   ManifestWork üretme; yalnızca label scriptini üret
   -h, --help          Bu yardımı göster
@@ -269,6 +277,11 @@ prepare_output_dir() {
   fi
   mkdir -p "$OUTPUT_DIR" || die "Çıktı dizini oluşturulamadı: $OUTPUT_DIR"
   [[ -w "$OUTPUT_DIR" ]] || die "Çıktı dizinine yazılamıyor: $OUTPUT_DIR"
+  # ManifestWork alt dizini yalnızca gerektiğinde oluşturulur; ama aynı adda bir
+  # dosya varsa bu, seçimler yapılmadan önce fark edilir.
+  if [[ -e "$OUTPUT_DIR/$MANIFESTWORK_SUBDIR" && ! -d "$OUTPUT_DIR/$MANIFESTWORK_SUBDIR" ]]; then
+    die "ManifestWork alt dizini bir dizin değil: $OUTPUT_DIR/$MANIFESTWORK_SUBDIR"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -756,7 +769,7 @@ render_manifests() {
 inspect_manifests() {
   local manifests_file="$1"
   local label="$2"
-  local kinds secrets hub_objects
+  local kinds secrets hub_objects mco_objects
 
   kinds="$(yq '[.[] | .kind] | unique | join(", ")' "$manifests_file")"
   info "  $label: $(yq 'length' "$manifests_file") obje ($kinds)"
@@ -771,6 +784,13 @@ inspect_manifests() {
   hub_objects="$(yq '[.[] | select(.apiVersion | test("^(policy|apps)\.open-cluster-management\.io/"))] | length' "$manifests_file")"
   if [[ "$hub_objects" != "0" ]]; then
     warn "$label $hub_objects adet ACM hub objesi (Policy/PlacementBinding vb.) içeriyor; bunlar managed cluster'a gönderilecek."
+  fi
+
+  # Var olan KubeletConfig/MachineConfig vb. objelerin güncellenmesi MCO'nun
+  # ilgili pool'daki node'ları sırayla yeniden başlatmasına yol açar.
+  mco_objects="$(yq '[.[] | select(.apiVersion | test("^machineconfiguration\.openshift\.io/"))] | length' "$manifests_file")"
+  if [[ "$mco_objects" != "0" ]]; then
+    warn "$label $mco_objects MachineConfiguration objesi içeriyor; var olan objeler güncellenirse MCO node'ları yeniden başlatabilir."
   fi
 }
 
@@ -795,9 +815,10 @@ kind_to_resource() {
 
 # Her manifest için spec.manifestConfigs girdisi üretir:
 #   resourceIdentifier: group / resource / name / (namespace)
-#   updateStrategy.type: CreateOnly
-# CreateOnly ile work agent objeyi yalnızca cluster'da yoksa oluşturur, var olan
-# objeyi hiçbir zaman güncellemez; böylece enjeksiyon gerçekten tek seferlik olur.
+#   updateStrategy: ServerSideApply, force: true
+# ServerSideApply ile work agent obje yoksa oluşturur, varsa yalnızca manifestte
+# bulunan alanları günceller. force, kurulumda başka bir field manager'ın
+# (installer, operator vb.) sahiplendiği alanların da devralınmasını sağlar.
 build_manifest_configs() {
   local manifests_file="$1"
   local configs_file="$2"
@@ -807,7 +828,7 @@ build_manifest_configs() {
 
   printf '[]\n' >"$configs_file"
   while IFS='|' read -r api_version kind name namespace; do
-    [[ -n "$name" ]] || die "$label: metadata.name içermeyen $kind objesi için CreateOnly tanımlanamaz."
+    [[ -n "$name" ]] || die "$label: metadata.name içermeyen $kind objesi için updateStrategy tanımlanamaz."
     # Core API (apiVersion: v1) için group boş string'dir.
     group=""
     [[ "$api_version" == */* ]] && group="${api_version%%/*}"
@@ -822,27 +843,26 @@ build_manifest_configs() {
           "name": strenv(RI_NAME),
           "namespace": strenv(RI_NAMESPACE)
         },
-        "updateStrategy": {"type": "CreateOnly"}
+        "updateStrategy": {
+          "type": "ServerSideApply",
+          "serverSideApply": {"force": true}
+        }
       }] |
       del(.[-1].resourceIdentifier.namespace | select(. == ""))
     ' "$configs_file" || die "$label: manifestConfigs oluşturulamadı ($kind/$name)."
     identifiers+=("$resource/$name")
-
-    # OpenShift'in config/operator singleton'ları (ör. Proxy/cluster) cluster'da
-    # her zaman vardır; CreateOnly ile bu objeler hiç güncellenmez.
-    if [[ "$name" == "cluster" && ( "$group" == "config.openshift.io" || "$group" == "operator.openshift.io" ) ]]; then
-      warn "$label $kind/$name cluster'da zaten var olan bir singleton; CreateOnly nedeniyle değişiklik uygulanmayacak."
-    fi
   done < <(yq '.[] | [.apiVersion, .kind, (.metadata.name // ""), (.metadata.namespace // "")] | join("|")' "$manifests_file")
 
-  info "  CreateOnly: ${identifiers[*]}"
+  info "  ServerSideApply (force): ${identifiers[*]}"
 }
 
 # Derlenmiş manifest dizisini, Orphan silme politikasına sahip bir ManifestWork'e sarar.
 #   metadata.namespace = cluster adı (hub'daki managed cluster namespace'i)
 #   spec.deleteOption.propagationPolicy = Orphan
-#   spec.manifestConfigs = her obje için updateStrategy CreateOnly
+#   spec.manifestConfigs = her obje için updateStrategy ServerSideApply (force)
 #   spec.workload.manifests = kustomize çıktısındaki tüm objeler
+# acm-sot/lifecycle=apply-once annotation'ı, ManifestWork'ün uygulandıktan sonra
+# silinmek üzere tasarlandığını belirtir (bkz. apply-manifestworks-<cluster>.sh).
 build_manifestwork() {
   local manifests_file="$1"
   local configs_file="$2"
@@ -867,9 +887,10 @@ build_manifestwork() {
     .metadata.name = strenv(MW_NAME) |
     .metadata.namespace = strenv(MW_NAMESPACE) |
     .metadata.labels."app.kubernetes.io/managed-by" = strenv(MW_MANAGED_BY) |
-    .metadata.labels."sot/policy" = strenv(MW_POLICY) |
-    .metadata.labels."sot/selection" = strenv(MW_SELECTION) |
-    .metadata.annotations."sot/source-path" = strenv(MW_SOURCE) |
+    .metadata.labels."acm-sot/policy" = strenv(MW_POLICY) |
+    .metadata.labels."acm-sot/selection" = strenv(MW_SELECTION) |
+    .metadata.annotations."acm-sot/source-path" = strenv(MW_SOURCE) |
+    .metadata.annotations."acm-sot/lifecycle" = "apply-once" |
     .spec.deleteOption.propagationPolicy = "Orphan" |
     .spec.manifestConfigs = load(strenv(MW_CONFIGS)) |
     .spec.workload.manifests = load(strenv(MW_MANIFESTS))
@@ -881,8 +902,8 @@ build_manifestwork() {
     || die "ManifestWork deleteOption doğrulaması başarısız: $output_file"
   [[ "$(yq '.spec.workload.manifests | length' "$output_file")" == "$manifest_count" ]] \
     || die "ManifestWork manifest sayısı doğrulaması başarısız: $output_file"
-  [[ "$(yq '[.spec.manifestConfigs[] | select(.updateStrategy.type == "CreateOnly")] | length' "$output_file")" == "$manifest_count" ]] \
-    || die "ManifestWork CreateOnly doğrulaması başarısız (her manifest için bir CreateOnly girdisi olmalı): $output_file"
+  [[ "$(yq '[.spec.manifestConfigs[] | select(.updateStrategy.type == "ServerSideApply" and .updateStrategy.serverSideApply.force == true)] | length' "$output_file")" == "$manifest_count" ]] \
+    || die "ManifestWork updateStrategy doğrulaması başarısız (her manifest için ServerSideApply/force girdisi olmalı): $output_file"
 
   local size
   size="$(wc -c <"$output_file" | tr -d ' ')"
@@ -956,11 +977,104 @@ write_label_script() {
   chmod +x "$target"
 }
 
-# Üretilen komutları terminale yazdırır; label scriptini ve ManifestWork
-# dosyalarını çıktı dizinine taşır. Dosyalar ancak tüm adımlar başarılıysa
-# yazıldığı için hata durumunda yarım çıktı kalmaz.
+# ManifestWork'leri tek seferlik uygulayan scripti hazırlar. Üretilen script
+# ManifestWork dosyalarını kendi bulunduğu dizinden okur.
+write_manifestwork_apply_script() {
+  local target="$1"
+  local file name
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# %s tarafından %s cluster için üretildi.\n' "$SCRIPT_NAME" "$CLUSTER_NAME"
+    cat <<'EOF'
+#
+# Her ManifestWork için tek seferlik uygulama akışı:
+#   1. Aynı adlı eski ManifestWork varsa silinir (Orphan: objeler cluster'da kalır).
+#   2. ManifestWork oluşturulur; work agent objeleri ServerSideApply (force) ile
+#      oluşturur veya var olanları günceller.
+#   3. Applied koşulu beklenir.
+#   4. ManifestWork silinir; Orphan sayesinde objeler cluster'da kalır ve artık
+#      ManifestWork tarafından yönetilmez.
+# Hata veya zaman aşımında script durur ve ManifestWork incelenmek üzere bırakılır.
+#
+# Ortam değişkenleri:
+#   OC                    Kullanılacak CLI (varsayılan: oc)
+#   MANIFESTWORK_TIMEOUT  Her adım için bekleme süresi (varsayılan: 10m)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+EOF
+    printf 'CLUSTER_NAMESPACE=%q\n' "$CLUSTER_NAME"
+    cat <<'EOF'
+OC="${OC:-oc}"
+TIMEOUT="${MANIFESTWORK_TIMEOUT:-10m}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+EOF
+    printf 'MANIFESTWORK_DIR="$SCRIPT_DIR/%s"\n' "$MANIFESTWORK_SUBDIR"
+    cat <<'EOF'
+
+apply_once() {
+  local name="$1"
+  local file="$MANIFESTWORK_DIR/$2"
+
+  printf '\n>> %s\n' "$name"
+  if [[ ! -f "$file" ]]; then
+    printf 'Hata: ManifestWork dosyası bulunamadı: %s\n' "$file" >&2
+    exit 1
+  fi
+
+  # Önceki bir çalıştırmadan kalan ManifestWork, eski Applied durumunun yanlış
+  # pozitif vermemesi için önce silinir. Orphan olduğu için objeler etkilenmez.
+  "$OC" delete manifestwork "$name" -n "$CLUSTER_NAMESPACE" \
+    --ignore-not-found --wait=true --timeout="$TIMEOUT"
+  "$OC" create -f "$file"
+
+  if ! "$OC" wait manifestwork "$name" -n "$CLUSTER_NAMESPACE" \
+      --for=condition=Applied --timeout="$TIMEOUT"; then
+    printf 'Hata: %s %s içinde uygulanamadı; ManifestWork incelenmek üzere bırakıldı.\n' "$name" "$TIMEOUT" >&2
+    "$OC" get manifestwork "$name" -n "$CLUSTER_NAMESPACE" \
+      -o jsonpath='{range .status.conditions[*]}  {.type}={.status} {.reason}: {.message}{"\n"}{end}' >&2 || true
+    exit 1
+  fi
+
+  "$OC" delete manifestwork "$name" -n "$CLUSTER_NAMESPACE" --wait=true --timeout="$TIMEOUT"
+  printf '%s uygulandı ve ManifestWork silindi; objeler cluster üzerinde kaldı.\n' "$name"
+}
+
+EOF
+    for file in "${MANIFESTWORK_FILES[@]}"; do
+      name="${file#manifestwork-}"
+      name="${name%.yaml}"
+      printf 'apply_once %q %q\n' "$name" "$file"
+    done
+  } >"$target"
+  chmod +x "$target"
+}
+
+# ManifestWork alt dizininde bu cluster'a ait olup bu çalıştırmada üretilmemiş
+# (önceki çalıştırmalardan kalmış) dosyalar için uyarı verir. Dosyalar silinmez;
+# apply-manifestworks scripti yalnızca bu çalıştırmada üretilenleri uygular.
+warn_stale_manifestworks() {
+  local mw_dir="$1"
+  local path file namespace
+  for path in "$mw_dir"/manifestwork-*.yaml; do
+    [[ -f "$path" ]] || continue
+    file="${path##*/}"
+    contains "$file" "${MANIFESTWORK_FILES[@]}" && continue
+    namespace="$(yq '.metadata.namespace // ""' "$path" 2>/dev/null || true)"
+    [[ "$namespace" == "$CLUSTER_NAME" ]] || continue
+    warn "$mw_dir/$file önceki bir çalıştırmadan kalmış; bu çalıştırmanın uygulama scriptine dahil değil."
+  done
+}
+
+# Üretilen komutları terminale yazdırır. Label scripti ve uygulama scripti
+# çıktı dizinine, ManifestWork YAML'ları çıktı dizinindeki manifestwork/ alt
+# dizinine taşınır. Dosyalar ancak tüm adımlar başarılıysa yazıldığı için hata
+# durumunda yarım çıktı kalmaz.
 write_output() {
   local command file
+  local apply_script=""
+  local mw_dir="$OUTPUT_DIR/$MANIFESTWORK_SUBDIR"
   printf '\nÜretilen label komutları:\n'
   for command in "${LABEL_COMMANDS[@]}"; do
     printf '%s\n' "$command"
@@ -968,20 +1082,34 @@ write_output() {
 
   [[ -n "$OUTPUT_FILE" ]] || OUTPUT_FILE="$OUTPUT_DIR/apply-labels-$CLUSTER_NAME.sh"
   write_label_script "$WORK_DIR/labels.sh"
-  mv "$WORK_DIR/labels.sh" "$OUTPUT_FILE" || die "Label scripti yazılamadı: $OUTPUT_FILE"
+  if [[ ${#MANIFESTWORK_FILES[@]} -gt 0 ]]; then
+    apply_script="apply-manifestworks-$CLUSTER_NAME.sh"
+    write_manifestwork_apply_script "$WORK_DIR/$apply_script"
+  fi
 
+  mv "$WORK_DIR/labels.sh" "$OUTPUT_FILE" || die "Label scripti yazılamadı: $OUTPUT_FILE"
   printf '\nÜretilen dosyalar:\n'
   printf '  %s\n' "$OUTPUT_FILE"
-  for file in "${MANIFESTWORK_FILES[@]+"${MANIFESTWORK_FILES[@]}"}"; do
-    mv "$WORK_DIR/$file" "$OUTPUT_DIR/$file" || die "ManifestWork yazılamadı: $OUTPUT_DIR/$file"
-    printf '  %s\n' "$OUTPUT_DIR/$file"
-  done
+  if [[ -n "$apply_script" ]]; then
+    mkdir -p "$mw_dir" || die "ManifestWork dizini oluşturulamadı: $mw_dir"
+    mv "$WORK_DIR/$apply_script" "$OUTPUT_DIR/$apply_script" \
+      || die "Uygulama scripti yazılamadı: $OUTPUT_DIR/$apply_script"
+    printf '  %s\n' "$OUTPUT_DIR/$apply_script"
+    for file in "${MANIFESTWORK_FILES[@]}"; do
+      mv "$WORK_DIR/$file" "$mw_dir/$file" || die "ManifestWork yazılamadı: $mw_dir/$file"
+      printf '  %s\n' "$mw_dir/$file"
+    done
+    warn_stale_manifestworks "$mw_dir"
+  fi
 
   printf '\nHub üzerinde uygulamak için:\n'
   printf '  bash %s\n' "$OUTPUT_FILE"
-  for file in "${MANIFESTWORK_FILES[@]+"${MANIFESTWORK_FILES[@]}"}"; do
-    printf '  oc apply -f %s\n' "$OUTPUT_DIR/$file"
-  done
+  if [[ -n "$apply_script" ]]; then
+    printf '  bash %s\n' "$OUTPUT_DIR/$apply_script"
+    printf '\nNot: ManifestWork dosyalarını doğrudan "oc apply" ile uygulamayın; silinene kadar\n'
+    printf 'objeleri ServerSideApply ile yönetmeye devam ederler. %s\n' "$apply_script"
+    printf 'her ManifestWork için uygula -> Applied bekle -> sil akışını çalıştırır.\n'
+  fi
 }
 
 # ---------------------------------------------------------------------------
